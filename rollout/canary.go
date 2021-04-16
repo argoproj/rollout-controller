@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/utils/integer"
 	"k8s.io/utils/pointer"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
@@ -184,15 +185,14 @@ func (c *rolloutContext) scaleDownOldReplicaSetsForCanary(allRSs []*appsv1.Repli
 			continue
 		}
 		// Scale down.
-		newReplicasCount := int32(0)
-		if *(targetRS.Spec.Replicas) > maxScaleDown {
-			newReplicasCount = *(targetRS.Spec.Replicas) - maxScaleDown
-		}
+		scaleDownCount := int32(integer.IntMin(int(*(targetRS.Spec.Replicas)), int(maxScaleDown-totalScaledDown)))
+		newReplicasCount := *(targetRS.Spec.Replicas) - scaleDownCount
+
 		_, _, err := c.scaleReplicaSetAndRecordEvent(targetRS, newReplicasCount)
 		if err != nil {
 			return totalScaledDown, err
 		}
-		scaleDownCount := *targetRS.Spec.Replicas - newReplicasCount
+		//scaleDownCount := *targetRS.Spec.Replicas - newReplicasCount
 		maxScaleDown -= scaleDownCount
 		totalScaledDown += scaleDownCount
 	}
