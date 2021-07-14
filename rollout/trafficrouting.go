@@ -3,6 +3,8 @@ package rollout
 import (
 	"time"
 
+	"github.com/argoproj/argo-rollouts/rollout/trafficrouting"
+
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/alb"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/ambassador"
@@ -14,20 +16,8 @@ import (
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
 )
 
-// TrafficRoutingReconciler common function across all TrafficRouting implementation
-type TrafficRoutingReconciler interface {
-	// UpdateHash informs a traffic routing reconciler about new canary/stable pod hashes
-	UpdateHash(canaryHash, stableHash string) error
-	// SetWeight sets the canary weight to the desired weight
-	SetWeight(desiredWeight int32) error
-	// VerifyWeight returns true if the canary is at the desired weight
-	VerifyWeight(desiredWeight int32) (bool, error)
-	// Type returns the type of the traffic routing reconciler
-	Type() string
-}
-
 // NewTrafficRoutingReconciler identifies return the TrafficRouting Plugin that the rollout wants to modify
-func (c *Controller) NewTrafficRoutingReconciler(roCtx *rolloutContext) (TrafficRoutingReconciler, error) {
+func (c *Controller) NewTrafficRoutingReconciler(roCtx *rolloutContext) (trafficrouting.TrafficRoutingReconciler, error) {
 	rollout := roCtx.rollout
 	if rollout.Spec.Strategy.Canary.TrafficRouting == nil {
 		return nil, nil
@@ -96,6 +86,7 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 
 	currentStep, index := replicasetutil.GetCurrentCanaryStep(c.rollout)
 	desiredWeight := int32(0)
+	weightDestinations := make([]trafficrouting.WeightDestination, 0)
 	if c.rollout.Status.StableRS == c.rollout.Status.CurrentPodHash {
 		// when we are fully promoted. desired canary weight should be 0
 	} else if c.pauseContext.IsAborted() {
@@ -110,7 +101,6 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 				step := c.rollout.Spec.Strategy.Canary.Steps[i]
 				if step.SetWeight != nil {
 					desiredWeight = *step.SetWeight
-					break
 				}
 			}
 		} else if *index != int32(len(c.rollout.Spec.Strategy.Canary.Steps)) {
@@ -122,9 +112,30 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 			// last setWeight step, which is set by GetCurrentSetWeight.
 			desiredWeight = replicasetutil.GetCurrentSetWeight(c.rollout)
 		}
+
+		exStep := replicasetutil.GetCurrentExperimentStep(c.rollout)
+		if exStep != nil {
+			getTemplateWeight := func(name string) *int32 {
+				for _, tmpl := range exStep.Templates {
+					if tmpl.Name == name {
+						return tmpl.Weight
+					}
+				}
+				return nil
+			}
+			// TODO: Check if Experiment is running
+			for _, templateStatus := range c.currentEx.Status.TemplateStatuses {
+				templateWeight := getTemplateWeight(templateStatus.Name)
+				weightDestinations = append(weightDestinations, trafficrouting.WeightDestination{
+					ServiceName:     templateStatus.ServiceName,
+					PodTemplateHash: templateStatus.PodTemplateHash,
+					Weight:          *templateWeight,
+				})
+			}
+		}
 	}
 
-	err = reconciler.SetWeight(desiredWeight)
+	err = reconciler.SetWeight(desiredWeight, weightDestinations...)
 	if err != nil {
 		c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: "TrafficRoutingError"}, err.Error())
 		return err

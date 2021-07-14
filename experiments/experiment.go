@@ -1,8 +1,11 @@
 package experiments
 
 import (
+	"context"
 	"fmt"
 	"time"
+
+	v1 "k8s.io/client-go/listers/core/v1"
 
 	log "github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,14 +35,17 @@ type experimentContext struct {
 	// parameters supplied to the context
 	ex                            *v1alpha1.Experiment
 	templateRSs                   map[string]*appsv1.ReplicaSet
+	templateServices              map[string]*corev1.Service
 	kubeclientset                 kubernetes.Interface
 	argoProjClientset             clientset.Interface
 	analysisTemplateLister        rolloutslisters.AnalysisTemplateLister
 	clusterAnalysisTemplateLister rolloutslisters.ClusterAnalysisTemplateLister
 	analysisRunLister             rolloutslisters.AnalysisRunLister
 	replicaSetLister              appslisters.ReplicaSetLister
+	serviceLister                 v1.ServiceLister
 	recorder                      record.EventRecorder
 	enqueueExperimentAfter        func(obj interface{}, duration time.Duration)
+	resyncPeriod                  time.Duration
 
 	// calculated values during reconciliation
 	log       *log.Entry
@@ -52,27 +58,33 @@ type experimentContext struct {
 func newExperimentContext(
 	experiment *v1alpha1.Experiment,
 	templateRSs map[string]*appsv1.ReplicaSet,
+	templateServices map[string]*corev1.Service,
 	kubeclientset kubernetes.Interface,
 	argoProjClientset clientset.Interface,
 	replicaSetLister appslisters.ReplicaSetLister,
 	analysisTemplateLister rolloutslisters.AnalysisTemplateLister,
 	clusterAnalysisTemplateLister rolloutslisters.ClusterAnalysisTemplateLister,
 	analysisRunLister rolloutslisters.AnalysisRunLister,
+	serviceLister v1.ServiceLister,
 	recorder record.EventRecorder,
+	resyncPeriod time.Duration,
 	enqueueExperimentAfter func(obj interface{}, duration time.Duration),
 ) *experimentContext {
 
 	exCtx := experimentContext{
 		ex:                            experiment,
 		templateRSs:                   templateRSs,
+		templateServices:              templateServices,
 		kubeclientset:                 kubeclientset,
 		argoProjClientset:             argoProjClientset,
 		replicaSetLister:              replicaSetLister,
 		analysisTemplateLister:        analysisTemplateLister,
 		clusterAnalysisTemplateLister: clusterAnalysisTemplateLister,
 		analysisRunLister:             analysisRunLister,
+		serviceLister:                 serviceLister,
 		recorder:                      recorder,
 		enqueueExperimentAfter:        enqueueExperimentAfter,
+		resyncPeriod:                  resyncPeriod,
 
 		log:           log.WithField(logutil.ExperimentKey, experiment.Name).WithField(logutil.NamespaceKey, experiment.Namespace),
 		newStatus:     experiment.Status.DeepCopy(),
@@ -98,7 +110,7 @@ func (ec *experimentContext) reconcile() *v1alpha1.ExperimentStatus {
 	return newStatus
 }
 
-// reconcileTemplate reconciles a template to a ReplicaSet. Creates or scales them down as necessary
+// reconcileTemplate reconciles a template to a ReplicaSet and/or Service. Creates or scales them down as necessary
 // will update status.templateStatuses with the current assessed values
 func (ec *experimentContext) reconcileTemplate(template v1alpha1.TemplateSpec) {
 	logCtx := ec.log.WithField("template", template.Name)
@@ -132,9 +144,56 @@ func (ec *experimentContext) reconcileTemplate(template v1alpha1.TemplateSpec) {
 			}
 		}
 	} else {
+		if desiredReplicaCount == 0 {
+			// Add scaleDownDelay if necessary
+			rsIsUpdated, err := ec.addScaleDownDelay(rs)
+			if err != nil {
+				ec.log.Warnf("Unable to add scaleDownDelay label on rs '%s'", rs.Name)
+			} else {
+				if rsIsUpdated {
+					ctx := context.TODO()
+					modifiedRS, err := ec.kubeclientset.AppsV1().ReplicaSets(ec.ex.Namespace).Get(ctx, rs.Name, metav1.GetOptions{})
+					if err != nil {
+						ec.log.Warnf("Unable to get rs '%s' with added scaleDownDelay", rs.Name)
+					} else {
+						rs = modifiedRS
+						ec.templateRSs[template.Name] = modifiedRS
+					}
+				}
+			}
+
+		}
 		// Replicaset exists. We ensure it is scaled properly based on termination, or changed replica count
 		if *rs.Spec.Replicas != desiredReplicaCount {
-			ec.scaleReplicaSetAndRecordEvent(rs, desiredReplicaCount)
+			if desiredReplicaCount == 0 {
+				// Add delay before scaling
+				if scaleDownAtStr, ok := rs.Annotations[v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey]; ok {
+					scaleDownAtTime, err := time.Parse(time.RFC3339, scaleDownAtStr)
+					if err != nil {
+						ec.log.Warnf("Unable to read scaleDownAt label on rs '%s'", rs.Name)
+					}
+					now := metav1.Now()
+					scaleDownAt := metav1.NewTime(scaleDownAtTime)
+					if scaleDownAt.After(now.Time) {
+						ec.log.Infof("RS '%s' has not reached the scaleDownTime", rs.Name)
+						remainingTime := scaleDownAt.Sub(now.Time)
+						if remainingTime < ec.resyncPeriod {
+							ec.enqueueExperimentAfter(ec.ex, remainingTime)
+						}
+						desiredReplicaCount = defaults.GetReplicasOrDefault(template.Replicas)
+					}
+				}
+			}
+			_, _, err := ec.scaleReplicaSetAndRecordEvent(rs, desiredReplicaCount)
+			if err != nil {
+				templateStatus.Status = v1alpha1.TemplateStatusError
+				templateStatus.Message = fmt.Sprintf("Unable to scale down ReplicaSet for template '%s': %v", template.Name, err)
+			} else {
+				if desiredReplicaCount == 0 && template.CreateService {
+					svc := ec.templateServices[template.Name]
+					ec.deleteTemplateService(svc, templateStatus, template.Name)
+				}
+			}
 			templateStatus.LastTransitionTime = &now
 		}
 	}
@@ -149,6 +208,31 @@ func (ec *experimentContext) reconcileTemplate(template v1alpha1.TemplateSpec) {
 		templateStatus.UpdatedReplicas = replicasetutil.GetActualReplicaCountForReplicaSets([]*appsv1.ReplicaSet{rs})
 		templateStatus.ReadyReplicas = replicasetutil.GetReadyReplicaCountForReplicaSets([]*appsv1.ReplicaSet{rs})
 		templateStatus.AvailableReplicas = replicasetutil.GetAvailableReplicaCountForReplicaSets([]*appsv1.ReplicaSet{rs})
+	}
+
+	// Create Service for template
+	// Use same Name and rollout-pod-template-hash as ReplicaSet
+	if template.CreateService && rs != nil {
+		podTemplateHash := rs.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+		svc := ec.templateServices[template.Name]
+		if desiredReplicaCount == 0 {
+			ec.deleteTemplateService(svc, templateStatus, template.Name)
+		} else if svc == nil || svc.Name != rs.Name {
+			newService, err := ec.CreateService(rs.Name, template, rs.Labels)
+			if err != nil {
+				templateStatus.Status = v1alpha1.TemplateStatusError
+				templateStatus.Message = fmt.Sprintf("Failed to create Service for template '%s': %v", template.Name, err)
+			} else {
+				ec.templateServices[template.Name] = newService
+				templateStatus.ServiceName = newService.Name
+				templateStatus.PodTemplateHash = podTemplateHash
+			}
+		}
+	} else if !template.CreateService {
+		// If CreateService is false but template has service, then create service
+		// Code should not enter this path
+		svc := ec.templateServices[template.Name]
+		ec.deleteTemplateService(svc, templateStatus, template.Name)
 	}
 
 	if prevStatus.Replicas != templateStatus.Replicas ||
@@ -206,6 +290,20 @@ func (ec *experimentContext) reconcileTemplate(template v1alpha1.TemplateSpec) {
 		ec.recorder.Eventf(ec.ex, record.EventOptions{EventType: eventType, EventReason: "Template" + string(templateStatus.Status)}, msg)
 	}
 	experimentutil.SetTemplateStatus(ec.newStatus, *templateStatus)
+}
+
+func (ec *experimentContext) deleteTemplateService(svc *corev1.Service, templateStatus *v1alpha1.TemplateStatus, templateName string) {
+	if svc != nil {
+		err := ec.deleteService(*svc)
+		if err != nil {
+			templateStatus.Status = v1alpha1.TemplateStatusError
+			templateStatus.Message = fmt.Sprintf("Failed to delete Service for template '%s': %v", templateName, err)
+		} else {
+			ec.templateServices[templateName] = nil
+			templateStatus.ServiceName = ""
+			templateStatus.PodTemplateHash = ""
+		}
+	}
 }
 
 // calculateEnqueueDuration returns an appropriate duration to requeue the experiment. This will be

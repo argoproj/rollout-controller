@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/utils/pointer"
+
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,17 +46,21 @@ func newTestContext(ex *v1alpha1.Experiment, objects ...runtime.Object) *experim
 	analysisRunLister := rolloutsI.Argoproj().V1alpha1().AnalysisRuns().Lister()
 	analysisTemplateLister := rolloutsI.Argoproj().V1alpha1().AnalysisTemplates().Lister()
 	clusterAnalysisTemplateLister := rolloutsI.Argoproj().V1alpha1().ClusterAnalysisTemplates().Lister()
+	serviceLister := k8sI.Core().V1().Services().Lister()
 
 	return newExperimentContext(
 		ex,
 		make(map[string]*appsv1.ReplicaSet),
+		make(map[string]*corev1.Service),
 		kubeclient,
 		rolloutclient,
 		rsLister,
 		analysisTemplateLister,
 		clusterAnalysisTemplateLister,
 		analysisRunLister,
+		serviceLister,
 		record.NewFakeEventRecorder(),
+		noResyncPeriodFunc(),
 		func(obj interface{}, duration time.Duration) {},
 	)
 }
@@ -68,6 +74,7 @@ func TestSetExperimentToPending(t *testing.T) {
 	defer f.Close()
 
 	rs := templateToRS(e, templates[0], 0)
+
 	f.expectCreateReplicaSetAction(rs)
 	f.expectPatchExperimentAction(e)
 	f.run(getKey(e, t))
@@ -83,8 +90,39 @@ func TestSetExperimentToPending(t *testing.T) {
 	assert.Equal(t, expectedPatch, patch)
 }
 
+// TestAddScaleDownDelayToRS verifies that we add a scale down delay to the ReplicaSet after experiment completes
+func TestAddScaleDownDelayToRS(t *testing.T) {
+	templates := generateTemplates("bar", "baz")
+	e := newExperiment("foo", templates, "")
+	e.Status.AvailableAt = now()
+	e.Status.Phase = v1alpha1.AnalysisPhaseRunning
+	cond := conditions.NewExperimentConditions(v1alpha1.ExperimentProgressing, corev1.ConditionTrue, conditions.NewRSAvailableReason, "Experiment \"foo\" is running.")
+	e.Status.Conditions = append(e.Status.Conditions, *cond)
+	rs1 := templateToRS(e, templates[0], 1)
+	rs2 := templateToRS(e, templates[1], 1)
+	e.Status.TemplateStatuses = []v1alpha1.TemplateStatus{
+		generateTemplatesStatus("bar", 1, 1, v1alpha1.TemplateStatusSuccessful, now()),
+		generateTemplatesStatus("baz", 1, 1, v1alpha1.TemplateStatusSuccessful, now()),
+	}
+
+	f := newFixture(t, e, rs1, rs2)
+	defer f.Close()
+
+	f.expectPatchExperimentAction(e)
+	patchRs1Index := f.expectPatchReplicaSetAction(rs1) // Add scaleDownDelaySeconds
+	f.expectGetReplicaSetAction(rs1)                    // Get RS after patch to modify updated version
+	patchRs2Index := f.expectPatchReplicaSetAction(rs2) // Add scaleDownDelaySeconds
+	f.expectGetReplicaSetAction(rs2)                    // Get RS after patch to modify updated version
+	f.run(getKey(e, t))
+
+	f.verifyPatchedReplicaSet(patchRs1Index, 30)
+	f.verifyPatchedReplicaSet(patchRs2Index, 30)
+}
+
+// TestScaleDownRSAfterFinish verifies that ScaleDownDelaySeconds annotation is added to ReplicaSet that is to be scaled down
 func TestScaleDownRSAfterFinish(t *testing.T) {
 	templates := generateTemplates("bar", "baz")
+
 	e := newExperiment("foo", templates, "")
 	e.Status.AvailableAt = now()
 	e.Status.Phase = v1alpha1.AnalysisPhaseRunning
@@ -96,6 +134,10 @@ func TestScaleDownRSAfterFinish(t *testing.T) {
 	e.Status.Conditions = append(e.Status.Conditions, *cond)
 	rs1 := templateToRS(e, templates[0], 1)
 	rs2 := templateToRS(e, templates[1], 1)
+
+	inThePast := metav1.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339)
+	rs1.Annotations[v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey] = inThePast
+	rs2.Annotations[v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey] = inThePast
 
 	f := newFixture(t, e, rs1, rs2)
 	defer f.Close()
@@ -302,4 +344,155 @@ func TestFailReplicaSetCreation(t *testing.T) {
 	newStatus := exCtx.reconcile()
 	assert.Equal(t, newStatus.TemplateStatuses[1].Status, v1alpha1.TemplateStatusError)
 	assert.Equal(t, newStatus.Phase, v1alpha1.AnalysisPhaseError)
+}
+
+// TestServiceCreationForTemplate verifies that a service is created for an experiment template if field CreateService is true
+func TestServiceCreationForTemplate(t *testing.T) {
+	templates := generateTemplates("bar", "baz")
+	templates[0].CreateService = true
+	templates[1].CreateService = false
+	ex := newExperiment("foo", templates, "")
+
+	rs1 := templateToRS(ex, templates[0], 0)
+	rs2 := templateToRS(ex, templates[1], 0)
+
+	s1 := templateToService(ex, templates[0], *rs1)
+	// Verify service is not created for template without weight set
+	s2 := templateToService(ex, templates[1], *rs2)
+	assert.Nil(t, s2)
+
+	f := newFixture(t, ex, rs1, rs2, s1)
+	defer f.Close()
+
+	f.expectCreateServiceAction(s1)
+	i := f.expectPatchExperimentAction(ex)
+
+	f.run(getKey(ex, t))
+
+	patch := f.getPatchedExperiment(i)
+
+	// Verify Experiment TemplateStatus contains reference to new service
+	expected := fmt.Sprintf("\"serviceName\":\"%s\"", s1.Name)
+	assert.Contains(t, patch, expected)
+}
+
+// TestDeleteOutdatedService verifies that outdated service for Template in templateServices map is deleted and new service is created
+func TestDeleteOutdatedService(t *testing.T) {
+	templates := generateTemplates("bar")
+	templates[0].CreateService = true
+	ex := newExperiment("foo", templates, "")
+
+	wrongService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "wrong-service"}}
+	ex.Status.TemplateStatuses = []v1alpha1.TemplateStatus{
+		generateTemplatesStatus("bar", 1, 1, v1alpha1.TemplateStatusRunning, now()),
+	}
+	ex.Status.TemplateStatuses[0].ServiceName = wrongService.Name
+
+	rs := templateToRS(ex, templates[0], 0)
+	s := templateToService(ex, templates[0], *rs)
+
+	exCtx := newTestContext(ex)
+
+	exCtx.templateRSs = map[string]*appsv1.ReplicaSet{
+		"bar": rs,
+	}
+
+	exCtx.templateServices = map[string]*corev1.Service{
+		"bar": wrongService,
+	}
+
+	exStatus := exCtx.reconcile()
+	assert.Equal(t, s.Name, exStatus.TemplateStatuses[0].ServiceName)
+	assert.Equal(t, s.Name, exCtx.templateServices["bar"].Name)
+	assert.NotContains(t, exCtx.templateServices, wrongService.Name)
+}
+
+func TestDeleteServiceIfDesiredReplicasEqualZero(t *testing.T) {
+	templates := generateTemplates("bar")
+	templates[0].CreateService = true
+	templates[0].Replicas = pointer.Int32Ptr(0)
+	ex := newExperiment("foo", templates, "")
+	ex.Spec.ScaleDownDelaySeconds = pointer.Int32Ptr(0)
+	ex.Status.TemplateStatuses = []v1alpha1.TemplateStatus{
+		generateTemplatesStatus("bar", 1, 1, v1alpha1.TemplateStatusRunning, now()),
+	}
+
+	svcToDelete := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "service-to-delete"}}
+	ex.Status.TemplateStatuses[0].ServiceName = svcToDelete.Name
+
+	exCtx := newTestContext(ex)
+
+	rs := templateToRS(ex, templates[0], 0)
+	rs.Annotations[v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey] = metav1.Now().UTC().Format(time.RFC3339)
+
+	exCtx.templateRSs = map[string]*appsv1.ReplicaSet{
+		"bar": rs,
+	}
+
+	exCtx.templateServices = map[string]*corev1.Service{
+		"bar": svcToDelete,
+	}
+
+	exStatus := exCtx.reconcile()
+
+	assert.Equal(t, "", exStatus.TemplateStatuses[0].ServiceName)
+	assert.Nil(t, exCtx.templateServices["bar"])
+}
+
+func TestDeleteServiceIfNotCreateService(t *testing.T) {
+	templates := generateTemplates("bar")
+	templates[0].Replicas = pointer.Int32Ptr(0)
+	ex := newExperiment("foo", templates, "")
+	ex.Status.TemplateStatuses = []v1alpha1.TemplateStatus{
+		generateTemplatesStatus("bar", 1, 1, v1alpha1.TemplateStatusRunning, now()),
+	}
+
+	svcToDelete := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "service-to-delete"}}
+	ex.Status.TemplateStatuses[0].ServiceName = svcToDelete.Name
+
+	exCtx := newTestContext(ex)
+
+	rs := templateToRS(ex, templates[0], 0)
+
+	exCtx.templateRSs = map[string]*appsv1.ReplicaSet{
+		"bar": rs,
+	}
+
+	exCtx.templateServices = map[string]*corev1.Service{
+		"bar": svcToDelete,
+	}
+
+	exStatus := exCtx.reconcile()
+
+	assert.Equal(t, "", exStatus.TemplateStatuses[0].ServiceName)
+	assert.Nil(t, exCtx.templateServices["bar"])
+}
+
+func TestDeleteServiceIfCreateServiceIsFalse(t *testing.T) {
+	templates := generateTemplates("bar")
+	templates[0].Replicas = pointer.Int32Ptr(0)
+	ex := newExperiment("foo", templates, "")
+	ex.Status.TemplateStatuses = []v1alpha1.TemplateStatus{
+		generateTemplatesStatus("bar", 1, 1, v1alpha1.TemplateStatusRunning, now()),
+	}
+
+	svcToDelete := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "service-to-delete"}}
+	ex.Status.TemplateStatuses[0].ServiceName = svcToDelete.Name
+
+	exCtx := newTestContext(ex)
+
+	rs := templateToRS(ex, templates[0], 0)
+
+	exCtx.templateRSs = map[string]*appsv1.ReplicaSet{
+		"bar": rs,
+	}
+
+	exCtx.templateServices = map[string]*corev1.Service{
+		"bar": svcToDelete,
+	}
+
+	exStatus := exCtx.reconcile()
+
+	assert.Equal(t, "", exStatus.TemplateStatuses[0].ServiceName)
+	assert.Nil(t, exCtx.templateServices["bar"])
 }

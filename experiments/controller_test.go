@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/stretchr/testify/assert"
 	"github.com/undefinedlabs/go-mpatch"
 
 	"github.com/argoproj/argo-rollouts/utils/queue"
 
-	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -234,6 +236,32 @@ func newCondition(reason string, experiment *v1alpha1.Experiment) *v1alpha1.Expe
 	return nil
 }
 
+func templateToService(ex *v1alpha1.Experiment, template v1alpha1.TemplateSpec, replicaSet appsv1.ReplicaSet) *corev1.Service {
+	if template.CreateService {
+		service := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      replicaSet.Name,
+				Namespace: ex.Namespace,
+				Annotations: map[string]string{
+					v1alpha1.ExperimentNameAnnotationKey:         ex.Name,
+					v1alpha1.ExperimentTemplateNameAnnotationKey: template.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ex, experimentKind)},
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: replicaSet.Spec.Selector.MatchLabels,
+				Ports: []corev1.ServicePort{{
+					Protocol:   "TCP",
+					Port:       int32(80),
+					TargetPort: intstr.FromInt(8080),
+				}},
+			},
+		}
+		return service
+	}
+	return nil
+}
+
 func templateToRS(ex *v1alpha1.Experiment, template v1alpha1.TemplateSpec, availableReplicas int32) *appsv1.ReplicaSet {
 	rsLabels := map[string]string{}
 	for k, v := range template.Selector.MatchLabels {
@@ -335,6 +363,7 @@ func (f *fixture) newController(resync resyncFunc) (*Controller, informers.Share
 		AnalysisRunInformer:             i.Argoproj().V1alpha1().AnalysisRuns(),
 		AnalysisTemplateInformer:        i.Argoproj().V1alpha1().AnalysisTemplates(),
 		ClusterAnalysisTemplateInformer: i.Argoproj().V1alpha1().ClusterAnalysisTemplates(),
+		ServiceInformer:                 k8sI.Core().V1().Services(),
 		ResyncPeriod:                    resync(),
 		RolloutWorkQueue:                rolloutWorkqueue,
 		ExperimentWorkQueue:             experimentWorkqueue,
@@ -484,13 +513,27 @@ func filterInformerActions(actions []core.Action) []core.Action {
 			action.Matches("list", "clusteranalysistemplates") ||
 			action.Matches("watch", "clusteranalysistemplates") ||
 			action.Matches("list", "analysisruns") ||
-			action.Matches("watch", "analysisruns") {
+			action.Matches("watch", "analysisruns") ||
+			action.Matches("watch", "services") ||
+			action.Matches("list", "services") {
 			continue
 		}
 		ret = append(ret, action)
 	}
 
 	return ret
+}
+
+func (f *fixture) expectCreateServiceAction(service *corev1.Service) int {
+	len := len(f.kubeactions)
+	f.kubeactions = append(f.kubeactions, core.NewCreateAction(schema.GroupVersionResource{Resource: "services"}, service.Namespace, service))
+	return len
+}
+
+func (f *fixture) expectDeleteServiceAction(service *corev1.Service) int {
+	len := len(f.kubeactions)
+	f.kubeactions = append(f.kubeactions, core.NewDeleteAction(schema.GroupVersionResource{Resource: "services"}, service.Namespace, service.Name))
+	return len
 }
 
 func (f *fixture) expectCreateReplicaSetAction(r *appsv1.ReplicaSet) int {
@@ -584,6 +627,17 @@ func (f *fixture) getCreatedReplicaSet(index int) *appsv1.ReplicaSet {
 	objMap, _ := converter.ToUnstructured(obj)
 	runtime.NewTestUnstructuredConverter(equality.Semantic).FromUnstructured(objMap, rs)
 	return rs
+}
+
+func (f *fixture) verifyPatchedReplicaSet(index int, scaleDownDelaySeconds int32) {
+	action := filterInformerActions(f.kubeclient.Actions())[index]
+	patchAction, ok := action.(core.PatchAction)
+	if !ok {
+		assert.Fail(f.t, "Expected Patch action, not %s", action.GetVerb())
+	}
+	now := metav1.Now().Add(time.Duration(scaleDownDelaySeconds) * time.Second).UTC().Format(time.RFC3339)
+	patch := fmt.Sprintf(addScaleDownAtAnnotationsPatch, v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey, now)
+	assert.Equal(f.t, string(patchAction.GetPatch()), patch)
 }
 
 func (f *fixture) getUpdatedReplicaSet(index int) *appsv1.ReplicaSet {
