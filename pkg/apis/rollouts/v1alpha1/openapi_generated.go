@@ -96,6 +96,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.ScopeDetail":                                     schema_pkg_apis_rollouts_v1alpha1_ScopeDetail(ref),
 		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.SecretKeyRef":                                    schema_pkg_apis_rollouts_v1alpha1_SecretKeyRef(ref),
 		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.SetCanaryScale":                                  schema_pkg_apis_rollouts_v1alpha1_SetCanaryScale(ref),
+		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.TemplateService":                                 schema_pkg_apis_rollouts_v1alpha1_TemplateService(ref),
 		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.TemplateSpec":                                    schema_pkg_apis_rollouts_v1alpha1_TemplateSpec(ref),
 		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.TemplateStatus":                                  schema_pkg_apis_rollouts_v1alpha1_TemplateStatus(ref),
 		"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.ValueFrom":                                       schema_pkg_apis_rollouts_v1alpha1_ValueFrom(ref),
@@ -1443,6 +1444,13 @@ func schema_pkg_apis_rollouts_v1alpha1_ExperimentSpec(ref common.ReferenceCallba
 									},
 								},
 							},
+						},
+					},
+					"scaleDownDelaySeconds": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ScaleDownDelaySeconds adds a delay before scaling down the Experiment. If omitted, the Experiment waits 30 seconds before scaling down. A minimum of 30 seconds is recommended to ensure IP table propagation across the nodes in a cluster. See https://github.com/argoproj/argo-rollouts/issues/19#issuecomment-476329960 for more information",
+							Type:        []string{"integer"},
+							Format:      "int32",
 						},
 					},
 				},
@@ -3372,6 +3380,16 @@ func schema_pkg_apis_rollouts_v1alpha1_SetCanaryScale(ref common.ReferenceCallba
 	}
 }
 
+func schema_pkg_apis_rollouts_v1alpha1_TemplateService(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_rollouts_v1alpha1_TemplateSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -3413,12 +3431,18 @@ func schema_pkg_apis_rollouts_v1alpha1_TemplateSpec(ref common.ReferenceCallback
 							Ref:         ref("k8s.io/api/core/v1.PodTemplateSpec"),
 						},
 					},
+					"service": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TemplateService describes how a service should be generated for template",
+							Ref:         ref("github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.TemplateService"),
+						},
+					},
 				},
 				Required: []string{"name", "selector", "template"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/api/core/v1.PodTemplateSpec", "k8s.io/apimachinery/pkg/apis/meta/v1.LabelSelector"},
+			"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.TemplateService", "k8s.io/api/core/v1.PodTemplateSpec", "k8s.io/apimachinery/pkg/apis/meta/v1.LabelSelector"},
 	}
 }
 
@@ -3494,6 +3518,20 @@ func schema_pkg_apis_rollouts_v1alpha1_TemplateStatus(ref common.ReferenceCallba
 						SchemaProps: spec.SchemaProps{
 							Description: "LastTransitionTime is the last time the replicaset transitioned, which resets the countdown on the ProgressDeadlineSeconds check.",
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"serviceName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ServiceName is the name of the service which corresponds to this experiment",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"podTemplateHash": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PodTemplateHash is the value of the Replicas' PodTemplateHash",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 				},
